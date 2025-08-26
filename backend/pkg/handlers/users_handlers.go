@@ -94,3 +94,77 @@ LEFT JOIN follows f
 	}
 	JSON(w, 200, out)
 }
+
+// GET /api/users/brief?id=<userId>
+func (h *UsersHandler) Brief(w http.ResponseWriter, r *http.Request) {
+	me, _ := auth.FromRequest(h.DB, r) // optional
+	targetID := r.URL.Query().Get("id")
+	if targetID == "" {
+		Err(w, 400, "id required")
+		return
+	}
+
+	meID := ""
+	if me != nil {
+		meID = me.ID
+	}
+	
+	row := h.DB.QueryRow(`
+		SELECT u.id, u.first_name, u.last_name, u.nickname, u.avatar_url,
+			   CASE WHEN u.is_private = 0 THEN 1 ELSE 0 END as is_public,
+		       COALESCE(f.status, '') AS rel_status
+		FROM users u
+		LEFT JOIN follows f ON f.follower_id = ? AND f.followee_id = u.id
+		WHERE u.id = ?`, meID, targetID)
+
+	var user struct {
+		ID          string  `json:"id"`
+		FirstName   *string `json:"firstName,omitempty"`
+		LastName    *string `json:"lastName,omitempty"`
+		Nickname    *string `json:"nickname,omitempty"`
+		AvatarURL   *string `json:"avatarUrl,omitempty"`
+		IsPublic    bool    `json:"isPublic"`
+		DisplayName string  `json:"displayName"`
+		Relation    string  `json:"relation"`
+	}
+	
+	var relStatus string
+	if err := row.Scan(&user.ID, &user.FirstName, &user.LastName, 
+		&user.Nickname, &user.AvatarURL, &user.IsPublic, &relStatus); err != nil {
+		if strings.Contains(err.Error(), "no rows") {
+			Err(w, 404, "user not found")
+			return
+		}
+		Err(w, 500, "db")
+		return
+	}
+
+	// Compute display name
+	if user.Nickname != nil && *user.Nickname != "" {
+		user.DisplayName = *user.Nickname
+	} else if user.FirstName != nil && *user.FirstName != "" {
+		name := *user.FirstName
+		if user.LastName != nil && *user.LastName != "" {
+			name += " " + *user.LastName
+		}
+		user.DisplayName = name
+	} else {
+		user.DisplayName = user.ID
+	}
+
+	// Compute relation
+	if me != nil && me.ID == user.ID {
+		user.Relation = "self"
+	} else {
+		switch strings.ToLower(relStatus) {
+		case "accepted":
+			user.Relation = "following"
+		case "pending":
+			user.Relation = "requested"
+		default:
+			user.Relation = "none"
+		}
+	}
+
+	JSON(w, 200, user)
+}

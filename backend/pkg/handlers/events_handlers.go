@@ -294,3 +294,4 @@ func (h *EventsHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 	JSON(w, 200, map[string]any{"ok": true})
 }
+

@@ -396,6 +396,175 @@ ORDER BY datetime(g.created_at) DESC`, u.ID)
 	JSON(w, 200, out)
 }
 
+// GET /api/groups/discover - browse all groups with member counts and ability to join
+func (h *GroupHandler) Discover(w http.ResponseWriter, r *http.Request) {
+	u, err := auth.FromRequest(h.DB, r)
+	if err != nil {
+		Err(w, 401, "unauth")
+		return
+	}
+
+	query := r.URL.Query().Get("q")
+	limit := 20
+
+	baseSQL := `
+SELECT g.id, g.title, g.description, g.owner_id, g.created_at,
+       COUNT(m.user_id) as member_count,
+       CASE WHEN my_membership.user_id IS NOT NULL THEN my_membership.status ELSE 'none' END as my_status
+FROM groups g
+LEFT JOIN group_members m ON m.group_id = g.id AND m.status = 'accepted'
+LEFT JOIN group_members my_membership ON my_membership.group_id = g.id AND my_membership.user_id = ?
+`
+	
+	params := []any{u.ID}
+	whereClause := " WHERE 1=1 "
+	
+	if query != "" {
+		whereClause += " AND (g.title LIKE ? OR g.description LIKE ?) "
+		likeQuery := "%" + query + "%"
+		params = append(params, likeQuery, likeQuery)
+	}
+
+	groupByOrderLimit := `
+GROUP BY g.id, g.title, g.description, g.owner_id, g.created_at, my_membership.status
+ORDER BY member_count DESC, g.created_at DESC
+LIMIT ?`
+	params = append(params, limit)
+
+	finalSQL := baseSQL + whereClause + groupByOrderLimit
+
+	rows, err := h.DB.Query(finalSQL, params...)
+	if err != nil {
+		Err(w, 500, "db")
+		return
+	}
+	defer rows.Close()
+
+	type GroupWithMeta struct {
+		Group
+		MemberCount int    `json:"memberCount"`
+		MyStatus    string `json:"myStatus"` // "none", "invited", "accepted", "requested"
+	}
+
+	out := []GroupWithMeta{}
+	for rows.Next() {
+		var g GroupWithMeta
+		if err := rows.Scan(&g.ID, &g.Title, &g.Description, &g.OwnerID, &g.CreatedAt, &g.MemberCount, &g.MyStatus); err == nil {
+			out = append(out, g)
+		}
+	}
+	JSON(w, 200, out)
+}
+
+// POST /api/groups/request-join {groupId} - request to join a group
+func (h *GroupHandler) RequestJoin(w http.ResponseWriter, r *http.Request) {
+	u, err := auth.FromRequest(h.DB, r)
+	if err != nil {
+		Err(w, 401, "unauth")
+		return
+	}
+	if r.Method != http.MethodPost {
+		Err(w, 405, "method")
+		return
+	}
+
+	var b struct {
+		GroupId int64 `json:"groupId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&b); err != nil || b.GroupId == 0 {
+		Err(w, 400, "bad json")
+		return
+	}
+
+	// Check if user already has a relationship with this group
+	var existing int
+	_ = h.DB.QueryRow(`SELECT COUNT(*) FROM group_members WHERE group_id=? AND user_id=?`, b.GroupId, u.ID).Scan(&existing)
+	if existing > 0 {
+		Err(w, 409, "already member or has pending request")
+		return
+	}
+
+	// Add user as requesting to join
+	_, err = h.DB.Exec(`INSERT INTO group_members (group_id, user_id, role, status) VALUES (?, ?, 'member', 'requested')`, b.GroupId, u.ID)
+	if err != nil {
+		Err(w, 500, "db")
+		return
+	}
+
+	JSON(w, 200, map[string]any{"ok": true})
+
+	// Notify group owner and admins about the join request
+	if h.Hub != nil {
+		// Get owner and admins
+		rows, err := h.DB.Query(`SELECT user_id FROM group_members WHERE group_id = ? AND role IN ('owner', 'admin') AND status = 'accepted'`, b.GroupId)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var adminId string
+				if rows.Scan(&adminId) == nil {
+					h.Hub.Broadcast("user:"+adminId, ws.Message{
+						Type:    "group_join_request",
+						Payload: map[string]any{"groupId": b.GroupId, "userId": u.ID},
+					})
+				}
+			}
+		}
+	}
+}
+
+// POST /api/groups/approve-join {groupId, userId} - approve join request (admin/owner only)
+func (h *GroupHandler) ApproveJoin(w http.ResponseWriter, r *http.Request) {
+	u, err := auth.FromRequest(h.DB, r)
+	if err != nil {
+		Err(w, 401, "unauth")
+		return
+	}
+	if r.Method != http.MethodPost {
+		Err(w, 405, "method")
+		return
+	}
+
+	var b struct {
+		GroupId int64  `json:"groupId"`
+		UserId  string `json:"userId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&b); err != nil || b.GroupId == 0 || b.UserId == "" {
+		Err(w, 400, "bad json")
+		return
+	}
+
+	// Check if requester is admin/owner
+	var role string
+	err = h.DB.QueryRow(`SELECT role FROM group_members WHERE group_id=? AND user_id=? AND status='accepted'`, b.GroupId, u.ID).Scan(&role)
+	if err != nil || (role != "owner" && role != "admin") {
+		Err(w, 403, "not admin")
+		return
+	}
+
+	// Approve the join request
+	res, err := h.DB.Exec(`UPDATE group_members SET status='accepted' WHERE group_id=? AND user_id=? AND status='requested'`, b.GroupId, b.UserId)
+	if err != nil {
+		Err(w, 500, "db")
+		return
+	}
+
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		Err(w, 404, "no pending request found")
+		return
+	}
+
+	JSON(w, 200, map[string]any{"ok": true})
+
+	// Notify approved user
+	if h.Hub != nil {
+		h.Hub.Broadcast("user:"+b.UserId, ws.Message{
+			Type:    "group_join_approved",
+			Payload: map[string]any{"groupId": b.GroupId, "approvedBy": u.ID},
+		})
+	}
+}
+
 // POST /api/groups/promote {groupId, userId} - promote member to admin (owner only)
 func (h *GroupHandler) Promote(w http.ResponseWriter, r *http.Request) {
 	u, err := auth.FromRequest(h.DB, r)
@@ -439,4 +608,52 @@ func (h *GroupHandler) Promote(w http.ResponseWriter, r *http.Request) {
 	}
 
 	JSON(w, 200, map[string]any{"ok": true})
+}
+
+// GET /api/groups/join-requests?groupId=123 - get pending join requests (admin/owner only)
+func (h *GroupHandler) PendingJoinRequests(w http.ResponseWriter, r *http.Request) {
+	u, err := auth.FromRequest(h.DB, r)
+	if err != nil {
+		Err(w, 401, "unauth")
+		return
+	}
+
+	groupId := r.URL.Query().Get("groupId")
+	if groupId == "" {
+		Err(w, 400, "groupId required")
+		return
+	}
+
+	// Check if requester is admin/owner
+	var role string
+	err = h.DB.QueryRow(`SELECT role FROM group_members WHERE group_id=? AND user_id=? AND status='accepted'`, groupId, u.ID).Scan(&role)
+	if err != nil || (role != "owner" && role != "admin") {
+		Err(w, 403, "not admin")
+		return
+	}
+
+	rows, err := h.DB.Query(`
+SELECT user_id, created_at
+FROM group_members 
+WHERE group_id=? AND status='requested'
+ORDER BY datetime(created_at) ASC`, groupId)
+	if err != nil {
+		Err(w, 500, "db")
+		return
+	}
+	defer rows.Close()
+
+	type JoinRequest struct {
+		UserId    string `json:"userId"`
+		CreatedAt string `json:"createdAt"`
+	}
+
+	out := []JoinRequest{}
+	for rows.Next() {
+		var jr JoinRequest
+		if err := rows.Scan(&jr.UserId, &jr.CreatedAt); err == nil {
+			out = append(out, jr)
+		}
+	}
+	JSON(w, 200, out)
 }

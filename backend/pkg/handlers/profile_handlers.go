@@ -135,19 +135,33 @@ func (h *ProfileHandler) SetPrivacy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	updated := int64(0)
-	// If we’re turning PUBLIC now, and the client asked to convert, make past posts public.
-	if body.IsPublic && body.ConvertOldPosts && currIsPrivate == 1 {
-		res, err := h.DB.Exec(`
-			UPDATE posts
-			   SET visibility='public'
-			 WHERE user_id=?
-			   AND visibility IN ('followers','private')`, u.ID)
-		if err != nil {
-			// Don’t fail the whole request if this part errors; report partial success
-			JSON(w, 200, map[string]any{"ok": true, "isPublic": body.IsPublic, "converted": 0, "note": "privacy updated; post conversion failed"})
-			return
+	// Handle bulk post conversion based on privacy change direction
+	if body.ConvertOldPosts {
+		if body.IsPublic && currIsPrivate == 1 {
+			// Converting from private profile to public profile: make posts public
+			res, err := h.DB.Exec(`
+				UPDATE posts
+				   SET visibility='public'
+				 WHERE user_id=?
+				   AND visibility IN ('followers','private')`, u.ID)
+			if err != nil {
+				JSON(w, 200, map[string]any{"ok": true, "isPublic": body.IsPublic, "converted": 0, "note": "privacy updated; post conversion failed"})
+				return
+			}
+			updated, _ = res.RowsAffected()
+		} else if !body.IsPublic && currIsPrivate == 0 {
+			// Converting from public profile to private profile: make posts followers-only
+			res, err := h.DB.Exec(`
+				UPDATE posts
+				   SET visibility='followers'
+				 WHERE user_id=?
+				   AND visibility='public'`, u.ID)
+			if err != nil {
+				JSON(w, 200, map[string]any{"ok": true, "isPublic": body.IsPublic, "converted": 0, "note": "privacy updated; post conversion failed"})
+				return
+			}
+			updated, _ = res.RowsAffected()
 		}
-		updated, _ = res.RowsAffected()
 	}
 
 	JSON(w, 200, map[string]any{
@@ -436,4 +450,309 @@ func (h *ProfileHandler) MakePostsPublic(w http.ResponseWriter, r *http.Request)
 	}
 	n, _ := res.RowsAffected()
 	JSON(w, 200, map[string]any{"ok": true, "updated": n})
+}
+
+// Enhanced profile data structure
+type EnhancedProfileUser struct {
+	ID        string  `json:"id"`
+	Email     *string `json:"email,omitempty"`     // Only shown to self
+	FirstName *string `json:"firstName,omitempty"`
+	LastName  *string `json:"lastName,omitempty"`
+	Nickname  *string `json:"nickname,omitempty"`
+	AboutMe   *string `json:"aboutMe,omitempty"`
+	AvatarURL *string `json:"avatarUrl,omitempty"`
+	DOB       *string `json:"dateOfBirth,omitempty"` // Only shown to self
+	IsPublic  bool    `json:"isPublic"`
+	CreatedAt string  `json:"createdAt"`
+}
+
+type PostSummary struct {
+	ID        int64   `json:"id"`
+	Body      string  `json:"body"`
+	ImageURL  *string `json:"imageUrl,omitempty"`
+	CreatedAt string  `json:"createdAt"`
+	LikeCount int     `json:"likeCount"`
+	IsLiked   bool    `json:"isLiked"`
+}
+
+type FollowUser struct {
+	ID        string  `json:"id"`
+	FirstName *string `json:"firstName,omitempty"`
+	LastName  *string `json:"lastName,omitempty"`
+	Nickname  *string `json:"nickname,omitempty"`
+	AvatarURL *string `json:"avatarUrl,omitempty"`
+	IsPublic  bool    `json:"isPublic"`
+}
+
+type EnhancedProfileResponse struct {
+	User       EnhancedProfileUser `json:"user"`
+	Stats      profileStats        `json:"stats"`
+	Relation   string              `json:"relation"`
+	Posts      []PostSummary       `json:"posts"`
+	CanViewAll bool                `json:"canViewAll"` // Whether requester can see private content
+}
+
+// GET /api/profile/enhanced?id=<userId>
+func (h *ProfileHandler) GetEnhanced(w http.ResponseWriter, r *http.Request) {
+	targetID := r.URL.Query().Get("id")
+	if targetID == "" {
+		Err(w, 400, "id required")
+		return
+	}
+
+	// requester (optional)
+	reqUser, _ := auth.FromRequest(h.DB, r)
+
+	// Get user details
+	row := h.DB.QueryRow(`
+		SELECT id, email, first_name, last_name, nickname, about, avatar_url, dob,
+			CASE WHEN is_private = 0 THEN 1 ELSE 0 END AS is_public, created_at
+		FROM users WHERE id = ?`, targetID)
+
+	var u EnhancedProfileUser
+	if err := row.Scan(&u.ID, &u.Email, &u.FirstName, &u.LastName, &u.Nickname, 
+		&u.AboutMe, &u.AvatarURL, &u.DOB, &u.IsPublic, &u.CreatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			Err(w, 404, "not found")
+			return
+		}
+		Err(w, 500, "db")
+		return
+	}
+
+	// stats
+	var stats profileStats
+	_ = h.DB.QueryRow(`SELECT COUNT(*) FROM follows WHERE followee_id=? AND status='accepted'`, u.ID).Scan(&stats.Followers)
+	_ = h.DB.QueryRow(`SELECT COUNT(*) FROM follows WHERE follower_id=? AND status='accepted'`, u.ID).Scan(&stats.Following)
+
+	// relation from requester to target
+	rel := "none"
+	canViewAll := false
+	isSelf := false
+
+	if reqUser != nil {
+		if reqUser.ID == u.ID {
+			rel = "self"
+			canViewAll = true
+			isSelf = true
+		} else {
+			var status string
+			_ = h.DB.QueryRow(`SELECT status FROM follows WHERE follower_id=? AND followee_id=?`, reqUser.ID, u.ID).Scan(&status)
+			switch strings.ToLower(status) {
+			case "accepted":
+				rel = "following"
+				canViewAll = true // followers can see private profiles
+			case "pending":
+				rel = "requested"
+			default:
+				rel = "none"
+			}
+		}
+	}
+
+	// If profile is public OR requester can view all OR no auth required, allow access
+	if u.IsPublic || canViewAll {
+		canViewAll = true
+	}
+
+	// Hide sensitive info if not self
+	if !isSelf {
+		u.Email = nil
+		u.DOB = nil
+	}
+
+	// Get posts (only if can view)
+	posts := []PostSummary{}
+	if canViewAll {
+		// Build visibility filter based on relationship
+		visibilityFilter := ""
+		if isSelf {
+			visibilityFilter = "" // can see all own posts
+		} else if rel == "following" {
+			visibilityFilter = "AND (p.visibility IN ('public', 'followers'))"
+		} else {
+			visibilityFilter = "AND p.visibility = 'public'"
+		}
+
+		query := `
+			SELECT p.id, p.body, p.image_url, p.created_at,
+				   COALESCE(like_counts.count, 0) as like_count,
+				   CASE WHEN user_likes.post_id IS NOT NULL THEN 1 ELSE 0 END as is_liked
+			FROM posts p
+			LEFT JOIN (
+				SELECT post_id, COUNT(*) as count 
+				FROM likes 
+				GROUP BY post_id
+			) like_counts ON like_counts.post_id = p.id
+			LEFT JOIN likes user_likes ON user_likes.post_id = p.id AND user_likes.user_id = ?
+			WHERE p.user_id = ? ` + visibilityFilter + `
+			ORDER BY p.created_at DESC 
+			LIMIT 20`
+
+		requesterID := ""
+		if reqUser != nil {
+			requesterID = reqUser.ID
+		}
+
+		rows, err := h.DB.Query(query, requesterID, targetID)
+		if err != nil {
+			// Don't fail the whole request, just return empty posts
+			posts = []PostSummary{}
+		} else {
+			defer rows.Close()
+			for rows.Next() {
+				var post PostSummary
+				if err := rows.Scan(&post.ID, &post.Body, &post.ImageURL, &post.CreatedAt, 
+					&post.LikeCount, &post.IsLiked); err == nil {
+					posts = append(posts, post)
+				}
+			}
+		}
+	}
+
+	JSON(w, 200, EnhancedProfileResponse{
+		User:       u,
+		Stats:      stats,
+		Relation:   rel,
+		Posts:      posts,
+		CanViewAll: canViewAll,
+	})
+}
+
+// GET /api/profile/followers?id=<userId>
+func (h *ProfileHandler) GetFollowers(w http.ResponseWriter, r *http.Request) {
+	targetID := r.URL.Query().Get("id")
+	if targetID == "" {
+		Err(w, 400, "id required")
+		return
+	}
+
+	// requester (optional)
+	reqUser, _ := auth.FromRequest(h.DB, r)
+
+	// Check if target exists and get privacy
+	var isPrivate int
+	if err := h.DB.QueryRow(`SELECT is_private FROM users WHERE id=?`, targetID).Scan(&isPrivate); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			Err(w, 404, "user not found")
+			return
+		}
+		Err(w, 500, "db")
+		return
+	}
+
+	// Check access permissions
+	canView := false
+	if reqUser != nil && reqUser.ID == targetID {
+		canView = true // can see own followers
+	} else if isPrivate == 0 {
+		canView = true // public profile
+	} else if reqUser != nil {
+		// Check if requester follows target
+		var followStatus string
+		_ = h.DB.QueryRow(`SELECT status FROM follows WHERE follower_id=? AND followee_id=?`, reqUser.ID, targetID).Scan(&followStatus)
+		if followStatus == "accepted" {
+			canView = true
+		}
+	}
+
+	if !canView {
+		JSON(w, 200, []FollowUser{}) // Return empty list for private profiles
+		return
+	}
+
+	rows, err := h.DB.Query(`
+		SELECT u.id, u.first_name, u.last_name, u.nickname, u.avatar_url,
+			   CASE WHEN u.is_private = 0 THEN 1 ELSE 0 END as is_public
+		FROM follows f
+		JOIN users u ON u.id = f.follower_id
+		WHERE f.followee_id = ? AND f.status = 'accepted'
+		ORDER BY u.first_name, u.last_name, u.id
+		LIMIT 200`, targetID)
+
+	if err != nil {
+		Err(w, 500, "db")
+		return
+	}
+	defer rows.Close()
+
+	followers := []FollowUser{}
+	for rows.Next() {
+		var user FollowUser
+		if err := rows.Scan(&user.ID, &user.FirstName, &user.LastName, 
+			&user.Nickname, &user.AvatarURL, &user.IsPublic); err == nil {
+			followers = append(followers, user)
+		}
+	}
+
+	JSON(w, 200, followers)
+}
+
+// GET /api/profile/following?id=<userId>
+func (h *ProfileHandler) GetFollowing(w http.ResponseWriter, r *http.Request) {
+	targetID := r.URL.Query().Get("id")
+	if targetID == "" {
+		Err(w, 400, "id required")
+		return
+	}
+
+	// requester (optional)
+	reqUser, _ := auth.FromRequest(h.DB, r)
+
+	// Check if target exists and get privacy
+	var isPrivate int
+	if err := h.DB.QueryRow(`SELECT is_private FROM users WHERE id=?`, targetID).Scan(&isPrivate); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			Err(w, 404, "user not found")
+			return
+		}
+		Err(w, 500, "db")
+		return
+	}
+
+	// Check access permissions
+	canView := false
+	if reqUser != nil && reqUser.ID == targetID {
+		canView = true // can see own following
+	} else if isPrivate == 0 {
+		canView = true // public profile
+	} else if reqUser != nil {
+		// Check if requester follows target
+		var followStatus string
+		_ = h.DB.QueryRow(`SELECT status FROM follows WHERE follower_id=? AND followee_id=?`, reqUser.ID, targetID).Scan(&followStatus)
+		if followStatus == "accepted" {
+			canView = true
+		}
+	}
+
+	if !canView {
+		JSON(w, 200, []FollowUser{}) // Return empty list for private profiles
+		return
+	}
+
+	rows, err := h.DB.Query(`
+		SELECT u.id, u.first_name, u.last_name, u.nickname, u.avatar_url,
+			   CASE WHEN u.is_private = 0 THEN 1 ELSE 0 END as is_public
+		FROM follows f
+		JOIN users u ON u.id = f.followee_id
+		WHERE f.follower_id = ? AND f.status = 'accepted'
+		ORDER BY u.first_name, u.last_name, u.id
+		LIMIT 200`, targetID)
+
+	if err != nil {
+		Err(w, 500, "db")
+		return
+	}
+	defer rows.Close()
+
+	following := []FollowUser{}
+	for rows.Next() {
+		var user FollowUser
+		if err := rows.Scan(&user.ID, &user.FirstName, &user.LastName, 
+			&user.Nickname, &user.AvatarURL, &user.IsPublic); err == nil {
+			following = append(following, user)
+		}
+	}
+
+	JSON(w, 200, following)
 }

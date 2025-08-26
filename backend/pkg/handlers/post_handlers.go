@@ -3,6 +3,7 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -346,4 +347,112 @@ func (h *PostHandler) ToggleLike(w http.ResponseWriter, r *http.Request) {
 			Payload: map[string]any{"postId": payload.PostID, "liked": liked == 1, "likes": total},
 		})
 	}
+}
+
+// PUT /api/posts/{id}/privacy - Update privacy of a specific post
+func (h *PostHandler) UpdatePrivacy(w http.ResponseWriter, r *http.Request) {
+	u, err := auth.FromRequest(h.DB, r)
+	if err != nil {
+		Err(w, 401, "unauthenticated")
+		return
+	}
+	if r.Method != http.MethodPut {
+		Err(w, 405, "method")
+		return
+	}
+
+	postIDStr := strings.TrimPrefix(r.URL.Path, "/api/posts/")
+	postIDStr = strings.TrimSuffix(postIDStr, "/privacy")
+	postID, err := strconv.ParseInt(postIDStr, 10, 64)
+	if err != nil {
+		Err(w, 400, "invalid post ID")
+		return
+	}
+
+	var req struct {
+		Visibility string   `json:"visibility"`           // "public" | "followers" | "private"
+		AllowedIDs []string `json:"allowedIds,omitempty"` // only for "private"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		Err(w, 400, "bad json")
+		return
+	}
+
+	// Validate visibility
+	if req.Visibility != "public" && req.Visibility != "followers" && req.Visibility != "private" {
+		Err(w, 400, "invalid visibility")
+		return
+	}
+
+	// Check if user owns the post
+	var authorID string
+	if err := h.DB.QueryRow(`SELECT user_id FROM posts WHERE id=?`, postID).Scan(&authorID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			Err(w, 404, "post not found")
+			return
+		}
+		Err(w, 500, "db")
+		return
+	}
+
+	if authorID != u.ID {
+		Err(w, 403, "not your post")
+		return
+	}
+
+	// Update post visibility
+	if _, err := h.DB.Exec(`UPDATE posts SET visibility=? WHERE id=?`, req.Visibility, postID); err != nil {
+		Err(w, 500, "db")
+		return
+	}
+
+	// Handle private post allowed users
+	if req.Visibility == "private" {
+		// Clear existing allowed users
+		if _, err := h.DB.Exec(`DELETE FROM post_allowed WHERE post_id=?`, postID); err != nil {
+			Err(w, 500, "db")
+			return
+		}
+
+		// Add new allowed users if provided
+		if len(req.AllowedIDs) > 0 {
+			tx, err := h.DB.Begin()
+			if err != nil {
+				Err(w, 500, "db")
+				return
+			}
+			defer tx.Rollback()
+
+			stmt, err := tx.Prepare(`INSERT OR IGNORE INTO post_allowed (post_id, user_id) VALUES (?,?)`)
+			if err != nil {
+				Err(w, 500, "db")
+				return
+			}
+			defer stmt.Close()
+
+			for _, allowedID := range req.AllowedIDs {
+				allowedID = strings.TrimSpace(allowedID)
+				if allowedID == "" || allowedID == u.ID {
+					continue
+				}
+				if _, err := stmt.Exec(postID, allowedID); err != nil {
+					Err(w, 500, "db")
+					return
+				}
+			}
+
+			if err := tx.Commit(); err != nil {
+				Err(w, 500, "db")
+				return
+			}
+		}
+	} else {
+		// For non-private posts, clear allowed users
+		if _, err := h.DB.Exec(`DELETE FROM post_allowed WHERE post_id=?`, postID); err != nil {
+			Err(w, 500, "db")
+			return
+		}
+	}
+
+	JSON(w, 200, map[string]any{"ok": true, "visibility": req.Visibility})
 }

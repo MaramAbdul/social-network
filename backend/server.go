@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	sqlite "social-network/backend/pkg/db"
@@ -44,22 +45,27 @@ func main() {
 
 	mux.HandleFunc("/api/dm/history", dm.History) // GET
 	mux.HandleFunc("/api/dm/send", dm.Send)       // POST
+	mux.HandleFunc("/api/dm/partners", dm.Partners) // GET
 
-	mux.HandleFunc("/api/groups/create", gh.Create)             // POST
-	mux.HandleFunc("/api/groups/my", gh.MyGroups)               // GET
-	mux.HandleFunc("/api/groups/invitations", gh.PendingInvitations) // GET
-	mux.HandleFunc("/api/groups/messages", gh.History)          // GET
-	mux.HandleFunc("/api/groups/send", gh.Send)                 // POST
-	mux.HandleFunc("/api/groups/members", gh.Members)           // GET
-	mux.HandleFunc("/api/groups/invite", gh.Invite)             // POST
-	mux.HandleFunc("/api/groups/join", gh.Join)                 // POST
-	mux.HandleFunc("/api/groups/leave", gh.Leave)               // POST
-	mux.HandleFunc("/api/groups/promote", gh.Promote)           // POST
+	mux.HandleFunc("/api/groups/create", gh.Create)                     // POST
+	mux.HandleFunc("/api/groups/my", gh.MyGroups)                       // GET
+	mux.HandleFunc("/api/groups/invitations", gh.PendingInvitations)    // GET
+	mux.HandleFunc("/api/groups/discover", gh.Discover)                 // GET
+	mux.HandleFunc("/api/groups/request-join", gh.RequestJoin)          // POST
+	mux.HandleFunc("/api/groups/approve-join", gh.ApproveJoin)          // POST
+	mux.HandleFunc("/api/groups/join-requests", gh.PendingJoinRequests) // GET
+	mux.HandleFunc("/api/groups/messages", gh.History)                  // GET
+	mux.HandleFunc("/api/groups/send", gh.Send)                         // POST
+	mux.HandleFunc("/api/groups/members", gh.Members)                   // GET
+	mux.HandleFunc("/api/groups/invite", gh.Invite)                     // POST
+	mux.HandleFunc("/api/groups/join", gh.Join)                         // POST
+	mux.HandleFunc("/api/groups/leave", gh.Leave)                       // POST
+	mux.HandleFunc("/api/groups/promote", gh.Promote)                   // POST
 
-	mux.HandleFunc("/api/events/create", eh.Create)             // POST
-	mux.HandleFunc("/api/events/group", eh.GetGroupEvents)      // GET
-	mux.HandleFunc("/api/events/respond", eh.Respond)           // POST
-	mux.HandleFunc("/api/events/delete", eh.Delete)             // DELETE
+	mux.HandleFunc("/api/events/create", eh.Create)        // POST
+	mux.HandleFunc("/api/events/group", eh.GetGroupEvents) // GET
+	mux.HandleFunc("/api/events/respond", eh.Respond)      // POST
+	mux.HandleFunc("/api/events/delete", eh.Delete)        // DELETE
 
 	// presence HTTP already added earlier:
 	// mux.HandleFunc("/api/presence/online", presence.Online)
@@ -75,11 +81,15 @@ func main() {
 	mux.HandleFunc("/api/notifications/mark_read", nh.MarkRead) // POST
 
 	mux.HandleFunc("/api/users/search", uh.Search) // GET ?q=
+	mux.HandleFunc("/api/users/brief", uh.Brief)   // GET ?id=
 	// profile & follow routes
-	mux.HandleFunc("/api/profile", phProf.Get)                  // GET ?id=<userId>
-	mux.HandleFunc("/api/profile/privacy", phProf.SetPrivacy)   // POST {isPublic}
-	mux.HandleFunc("/api/follow/request", phProf.FollowRequest) // POST {userId}
-	mux.HandleFunc("/api/follow/unfollow", phProf.Unfollow)     // POST {userId}
+	mux.HandleFunc("/api/profile", phProf.Get)                    // GET ?id=<userId>
+	mux.HandleFunc("/api/profile/enhanced", phProf.GetEnhanced)   // GET ?id=<userId> (with posts, detailed info)
+	mux.HandleFunc("/api/profile/followers", phProf.GetFollowers) // GET ?id=<userId>
+	mux.HandleFunc("/api/profile/following", phProf.GetFollowing) // GET ?id=<userId>
+	mux.HandleFunc("/api/profile/privacy", phProf.SetPrivacy)     // POST {isPublic}
+	mux.HandleFunc("/api/follow/request", phProf.FollowRequest)   // POST {userId}
+	mux.HandleFunc("/api/follow/unfollow", phProf.Unfollow)       // POST {userId}
 
 	mux.HandleFunc("/api/follow/requests", phProf.ListRequests) // GET
 	mux.HandleFunc("/api/follow/accept", phProf.Accept)         // POST {userId}
@@ -108,6 +118,14 @@ func main() {
 	mux.HandleFunc("/api/my/posts", ph.ListMine)
 	mux.HandleFunc("/api/posts/delete", ph.Delete)
 	mux.HandleFunc("/api/posts/like", ph.ToggleLike)
+	mux.HandleFunc("/api/posts/", func(w http.ResponseWriter, r *http.Request) {
+		// Handle /api/posts/{id}/privacy
+		if strings.HasSuffix(r.URL.Path, "/privacy") {
+			ph.UpdatePrivacy(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	})
 
 	// comments
 	mux.HandleFunc("/api/comments", func(w http.ResponseWriter, r *http.Request) {

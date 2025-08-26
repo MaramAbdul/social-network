@@ -92,3 +92,40 @@ func (h *DMHandler) Send(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 }
+
+// GET /api/dm/partners - returns users I've chatted with recently
+func (h *DMHandler) Partners(w http.ResponseWriter, r *http.Request) {
+	u, err := auth.FromRequest(h.DB, r)
+	if err != nil { Err(w, 401, "unauth"); return }
+
+	// Get recent chat partners with last message timestamp
+	rows, err := h.DB.Query(`
+		SELECT DISTINCT 
+			CASE 
+				WHEN sender_id = ? THEN recipient_id 
+				ELSE sender_id 
+			END as partner_id,
+			MAX(datetime(created_at)) as last_message_at
+		FROM dm_messages 
+		WHERE sender_id = ? OR recipient_id = ?
+		GROUP BY partner_id
+		ORDER BY last_message_at DESC
+		LIMIT 50
+	`, u.ID, u.ID, u.ID)
+	if err != nil { Err(w, 500, "db"); return }
+	defer rows.Close()
+
+	type ChatPartner struct {
+		ID            string `json:"id"`
+		LastMessageAt string `json:"lastMessageAt"`
+	}
+	partners := []ChatPartner{}
+	for rows.Next() {
+		var p ChatPartner
+		if err := rows.Scan(&p.ID, &p.LastMessageAt); err == nil {
+			partners = append(partners, p)
+		}
+	}
+	JSON(w, 200, partners)
+}
+
