@@ -3,6 +3,7 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -53,13 +54,21 @@ func (h *CommentHandler) Create(w http.ResponseWriter, r *http.Request) {
 	out := Comment{ID: id, PostID: req.PostID, UserID: u.ID, Body: req.Body, CreatedAt: time.Now().UTC().Format("2006-01-02 15:04:05")}
 	JSON(w, 200, out)
 
-	if h.Hub != nil {
-		room := "post:" + strconv.FormatInt(req.PostID, 10)
-		h.Hub.Broadcast(room, ws.Message{
-			Type: "comment_created", Room: room, From: u.ID, At: time.Now().Unix(),
-			Payload: out,
-		})
-	}
+	// Broadcast via WebSocket (in goroutine to avoid blocking HTTP response)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Panic in comment broadcast: %v", r)
+			}
+		}()
+		if h.Hub != nil {
+			room := "post:" + strconv.FormatInt(req.PostID, 10)
+			h.Hub.Broadcast(room, ws.Message{
+				Type: "comment_created", Room: room, From: u.ID, At: time.Now().Unix(),
+				Payload: out,
+			})
+		}
+	}()
 }
 
 func (h *CommentHandler) ListByPost(w http.ResponseWriter, r *http.Request) {

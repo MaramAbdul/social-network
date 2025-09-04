@@ -90,7 +90,7 @@ ORDER BY datetime(g.created_at) DESC`, u.ID)
 	JSON(w, 200, out)
 }
 
-// GET /api/groups/messages?groupId=123&limit=50
+// GET /api/groups/messages?groupId=123&limit=10
 func (h *GroupHandler) History(w http.ResponseWriter, r *http.Request) {
 	u, err := auth.FromRequest(h.DB, r)
 	if err != nil {
@@ -112,11 +112,24 @@ func (h *GroupHandler) History(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limit := 50
+	limit := 10
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, _ := strconv.Atoi(l); n > 0 && n <= 100 {
+			limit = n
+		}
+	}
+
+	offset := 0
+	if o := r.URL.Query().Get("offset"); o != "" {
+		if n, _ := strconv.Atoi(o); n >= 0 {
+			offset = n
+		}
+	}
+
 	rows, err := h.DB.Query(`
 SELECT id, group_id, sender_id, body, created_at
 FROM group_messages WHERE group_id=?
-ORDER BY datetime(created_at) DESC LIMIT ?`, gid, limit)
+ORDER BY datetime(created_at) DESC LIMIT ? OFFSET ?`, gid, limit, offset)
 	if err != nil {
 		Err(w, 500, "db")
 		return
@@ -415,10 +428,10 @@ FROM groups g
 LEFT JOIN group_members m ON m.group_id = g.id AND m.status = 'accepted'
 LEFT JOIN group_members my_membership ON my_membership.group_id = g.id AND my_membership.user_id = ?
 `
-	
+
 	params := []any{u.ID}
 	whereClause := " WHERE 1=1 "
-	
+
 	if query != "" {
 		whereClause += " AND (g.title LIKE ? OR g.description LIKE ?) "
 		likeQuery := "%" + query + "%"
@@ -494,17 +507,32 @@ func (h *GroupHandler) RequestJoin(w http.ResponseWriter, r *http.Request) {
 	JSON(w, 200, map[string]any{"ok": true})
 
 	// Notify group owner and admins about the join request
-	if h.Hub != nil {
-		// Get owner and admins
-		rows, err := h.DB.Query(`SELECT user_id FROM group_members WHERE group_id = ? AND role IN ('owner', 'admin') AND status = 'accepted'`, b.GroupId)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var adminId string
-				if rows.Scan(&adminId) == nil {
+	// Get owner and admins
+	rows, err := h.DB.Query(`SELECT user_id FROM group_members WHERE group_id = ? AND role IN ('owner', 'admin') AND status = 'accepted'`, b.GroupId)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var adminId string
+			if rows.Scan(&adminId) == nil {
+				// Store notification in database
+				res, _ := h.DB.Exec(
+					`INSERT INTO notifications (user_id, type, actor_id, created_at)
+					VALUES (?, 'group_join_request', ?, datetime('now'))`,
+					adminId, u.ID,
+				)
+
+				// Send real-time notification
+				if h.Hub != nil && res != nil {
+					id, _ := res.LastInsertId()
 					h.Hub.Broadcast("user:"+adminId, ws.Message{
-						Type:    "group_join_request",
-						Payload: map[string]any{"groupId": b.GroupId, "userId": u.ID},
+						Type: "notification",
+						Payload: map[string]any{
+							"id":        id,
+							"type":      "group_join_request",
+							"actorId":   u.ID,
+							"groupId":   b.GroupId,
+							"createdAt": time.Now().UTC().Format("2006-01-02 15:04:05"),
+						},
 					})
 				}
 			}
@@ -557,10 +585,25 @@ func (h *GroupHandler) ApproveJoin(w http.ResponseWriter, r *http.Request) {
 	JSON(w, 200, map[string]any{"ok": true})
 
 	// Notify approved user
-	if h.Hub != nil {
+	// Store notification in database
+	res, _ = h.DB.Exec(
+		`INSERT INTO notifications (user_id, type, actor_id, created_at)
+		VALUES (?, 'group_join_approved', ?, datetime('now'))`,
+		b.UserId, u.ID,
+	)
+
+	// Send real-time notification
+	if h.Hub != nil && res != nil {
+		id, _ := res.LastInsertId()
 		h.Hub.Broadcast("user:"+b.UserId, ws.Message{
-			Type:    "group_join_approved",
-			Payload: map[string]any{"groupId": b.GroupId, "approvedBy": u.ID},
+			Type: "notification",
+			Payload: map[string]any{
+				"id":        id,
+				"type":      "group_join_approved",
+				"actorId":   u.ID,
+				"groupId":   b.GroupId,
+				"createdAt": time.Now().UTC().Format("2006-01-02 15:04:05"),
+			},
 		})
 	}
 }
@@ -633,10 +676,11 @@ func (h *GroupHandler) PendingJoinRequests(w http.ResponseWriter, r *http.Reques
 	}
 
 	rows, err := h.DB.Query(`
-SELECT user_id, created_at
-FROM group_members 
-WHERE group_id=? AND status='requested'
-ORDER BY datetime(created_at) ASC`, groupId)
+SELECT gm.user_id, gm.created_at, u.first_name, u.last_name, u.nickname
+FROM group_members gm
+LEFT JOIN users u ON u.id = gm.user_id
+WHERE gm.group_id=? AND gm.status='requested'
+ORDER BY datetime(gm.created_at) ASC`, groupId)
 	if err != nil {
 		Err(w, 500, "db")
 		return
@@ -644,16 +688,115 @@ ORDER BY datetime(created_at) ASC`, groupId)
 	defer rows.Close()
 
 	type JoinRequest struct {
-		UserId    string `json:"userId"`
-		CreatedAt string `json:"createdAt"`
+		UserId    string  `json:"userId"`
+		CreatedAt string  `json:"createdAt"`
+		FirstName *string `json:"firstName,omitempty"`
+		LastName  *string `json:"lastName,omitempty"`
+		Nickname  *string `json:"nickname,omitempty"`
 	}
 
 	out := []JoinRequest{}
 	for rows.Next() {
 		var jr JoinRequest
-		if err := rows.Scan(&jr.UserId, &jr.CreatedAt); err == nil {
+		if err := rows.Scan(&jr.UserId, &jr.CreatedAt, &jr.FirstName, &jr.LastName, &jr.Nickname); err == nil {
 			out = append(out, jr)
 		}
 	}
 	JSON(w, 200, out)
+}
+
+// POST /api/groups/reject-join {groupId, userId} - reject join request (admin/owner only)
+func (h *GroupHandler) RejectJoin(w http.ResponseWriter, r *http.Request) {
+	u, err := auth.FromRequest(h.DB, r)
+	if err != nil {
+		Err(w, 401, "unauth")
+		return
+	}
+	if r.Method != http.MethodPost {
+		Err(w, 405, "method")
+		return
+	}
+
+	var body struct {
+		GroupId int64  `json:"groupId"`
+		UserId  string `json:"userId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.GroupId == 0 || body.UserId == "" {
+		Err(w, 400, "bad json")
+		return
+	}
+
+	// Check if user is admin/owner
+	var role string
+	err = h.DB.QueryRow(`SELECT role FROM group_members WHERE group_id=? AND user_id=? AND status='accepted'`, body.GroupId, u.ID).Scan(&role)
+	if err != nil || (role != "owner" && role != "admin") {
+		Err(w, 403, "not admin")
+		return
+	}
+
+	// Remove the join request
+	_, err = h.DB.Exec(`DELETE FROM group_members WHERE group_id=? AND user_id=? AND status='requested'`, body.GroupId, body.UserId)
+	if err != nil {
+		Err(w, 500, "db")
+		return
+	}
+
+	JSON(w, 200, map[string]any{"ok": true})
+}
+
+// POST /api/groups/kick {groupId, userId} - kick member (owner only)
+func (h *GroupHandler) Kick(w http.ResponseWriter, r *http.Request) {
+	u, err := auth.FromRequest(h.DB, r)
+	if err != nil {
+		Err(w, 401, "unauth")
+		return
+	}
+	if r.Method != http.MethodPost {
+		Err(w, 405, "method")
+		return
+	}
+
+	var body struct {
+		GroupId int64  `json:"groupId"`
+		UserId  string `json:"userId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.GroupId == 0 || body.UserId == "" {
+		Err(w, 400, "bad json")
+		return
+	}
+
+	// Check if user is owner
+	var role string
+	err = h.DB.QueryRow(`SELECT role FROM group_members WHERE group_id=? AND user_id=? AND status='accepted'`, body.GroupId, u.ID).Scan(&role)
+	if err != nil || role != "owner" {
+		Err(w, 403, "not owner")
+		return
+	}
+
+	// Don't allow kicking self
+	if body.UserId == u.ID {
+		Err(w, 400, "cannot kick self")
+		return
+	}
+
+	// Remove the member
+	_, err = h.DB.Exec(`DELETE FROM group_members WHERE group_id=? AND user_id=?`, body.GroupId, body.UserId)
+	if err != nil {
+		Err(w, 500, "db")
+		return
+	}
+
+	JSON(w, 200, map[string]any{"ok": true})
+
+	// Notify the kicked user
+	if h.Hub != nil {
+		h.Hub.Broadcast("user:"+body.UserId, ws.Message{
+			Type: "notification",
+			Payload: map[string]any{
+				"type":    "kicked_from_group",
+				"actorId": u.ID,
+				"groupId": body.GroupId,
+			},
+		})
+	}
 }

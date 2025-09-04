@@ -3,7 +3,9 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"social-network/backend/pkg/auth"
@@ -58,8 +60,20 @@ func (h *EventsHandler) Create(w http.ResponseWriter, r *http.Request) {
 		Description *string `json:"description"`
 		EventDate   string  `json:"eventDate"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.GroupID == 0 || body.Title == "" || body.EventDate == "" {
-		Err(w, 400, "bad json")
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		Err(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if body.GroupID == 0 {
+		Err(w, 400, "groupId is required")
+		return
+	}
+	if body.Title == "" {
+		Err(w, 400, "title is required")
+		return
+	}
+	if body.EventDate == "" {
+		Err(w, 400, "eventDate is required")
 		return
 	}
 
@@ -72,16 +86,24 @@ func (h *EventsHandler) Create(w http.ResponseWriter, r *http.Request) {
 	// Check if user is admin/owner of the group
 	var role string
 	err = h.DB.QueryRow(`SELECT role FROM group_members WHERE group_id=? AND user_id=? AND status='accepted'`, body.GroupID, u.ID).Scan(&role)
-	if err != nil || (role != "owner" && role != "admin") {
-		Err(w, 403, "not admin")
+	if err != nil {
+		if err == sql.ErrNoRows {
+			Err(w, 403, "not a member of this group")
+		} else {
+			Err(w, 500, "database error: "+err.Error())
+		}
+		return
+	}
+	if role != "owner" && role != "admin" {
+		Err(w, 403, "only group owners and admins can create events")
 		return
 	}
 
 	// Create event
-	res, err := h.DB.Exec(`INSERT INTO events (group_id, creator_id, title, description, event_date) 
-		VALUES (?, ?, ?, ?, ?)`, body.GroupID, u.ID, body.Title, body.Description, body.EventDate)
+	res, err := h.DB.Exec(`INSERT INTO events (group_id, creator_id, title, description, event_date, created_at) 
+		VALUES (?, ?, ?, ?, ?, datetime('now'))`, body.GroupID, u.ID, body.Title, body.Description, body.EventDate)
 	if err != nil {
-		Err(w, 500, "db")
+		Err(w, 500, "failed to create event: "+err.Error())
 		return
 	}
 
@@ -98,8 +120,31 @@ func (h *EventsHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	JSON(w, 200, event)
 
-	// Notify all group members about new event
-	if h.Hub != nil {
+	// Broadcast event to group room for real-time updates (in goroutine to avoid blocking HTTP response)
+	go func() {
+		if h.Hub != nil {
+			defer func() {
+				if r := recover(); r != nil {
+					// Log the panic but don't crash the server
+					log.Printf("Panic in event broadcast: %v", r)
+				}
+			}()
+			room := "group:" + strconv.FormatInt(body.GroupID, 10)
+			h.Hub.Broadcast(room, ws.Message{
+				Type:    "group_event",
+				Payload: event,
+			})
+		}
+	}()
+
+	// Notify all group members about new event (in goroutine to avoid blocking HTTP response)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Panic in event notification: %v", r)
+			}
+		}()
+		
 		// Get all group members
 		rows, err := h.DB.Query(`SELECT user_id FROM group_members WHERE group_id=? AND status='accepted' AND user_id<>?`, body.GroupID, u.ID)
 		if err == nil {
@@ -107,21 +152,33 @@ func (h *EventsHandler) Create(w http.ResponseWriter, r *http.Request) {
 			for rows.Next() {
 				var memberID string
 				if err := rows.Scan(&memberID); err == nil {
-					h.Hub.Broadcast("user:"+memberID, ws.Message{
-						Type: "notification",
-						Payload: map[string]any{
-							"type":      "event_created",
-							"actorId":   u.ID,
-							"eventId":   eventID,
-							"groupId":   body.GroupID,
-							"title":     body.Title,
-							"createdAt": time.Now().UTC().Format("2006-01-02 15:04:05"),
-						},
-					})
+					// Store notification in database
+					res, _ := h.DB.Exec(
+						`INSERT INTO notifications (user_id, type, actor_id, created_at)
+						VALUES (?, 'event_created', ?, datetime('now'))`,
+						memberID, u.ID,
+					)
+					
+					// Send real-time notification
+					if h.Hub != nil && res != nil {
+						id, _ := res.LastInsertId()
+						h.Hub.Broadcast("user:"+memberID, ws.Message{
+							Type: "notification",
+							Payload: map[string]any{
+								"id":        id,
+								"type":      "event_created",
+								"actorId":   u.ID,
+								"eventId":   eventID,
+								"groupId":   body.GroupID,
+								"title":     body.Title,
+								"createdAt": time.Now().UTC().Format("2006-01-02 15:04:05"),
+							},
+						})
+					}
 				}
 			}
 		}
-	}
+	}()
 }
 
 // GET /api/events/group?groupId=123
@@ -239,6 +296,27 @@ func (h *EventsHandler) Respond(w http.ResponseWriter, r *http.Request) {
 	}
 
 	JSON(w, 200, map[string]any{"ok": true, "response": body.Response})
+
+	// Broadcast event response update to group room for real-time updates
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Panic in event response broadcast: %v", r)
+			}
+		}()
+		if h.Hub != nil {
+			room := "group:" + strconv.FormatInt(groupID, 10)
+			h.Hub.Broadcast(room, ws.Message{
+				Type: "group_event_response",
+				Payload: map[string]any{
+					"eventId":  body.EventID,
+					"groupId":  groupID,
+					"userId":   u.ID,
+					"response": body.Response,
+				},
+			})
+		}
+	}()
 }
 
 // DELETE /api/events/delete?eventId=123
@@ -293,5 +371,24 @@ func (h *EventsHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	JSON(w, 200, map[string]any{"ok": true})
+
+	// Broadcast event deletion to group room for real-time updates
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Panic in event deletion broadcast: %v", r)
+			}
+		}()
+		if h.Hub != nil {
+			room := "group:" + strconv.FormatInt(groupID, 10)
+			h.Hub.Broadcast(room, ws.Message{
+				Type: "group_event_deleted",
+				Payload: map[string]any{
+					"eventId": eventID,
+					"groupId": groupID,
+				},
+			})
+		}
+	}()
 }
 

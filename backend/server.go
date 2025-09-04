@@ -54,6 +54,8 @@ func main() {
 	mux.HandleFunc("/api/groups/request-join", gh.RequestJoin)          // POST
 	mux.HandleFunc("/api/groups/approve-join", gh.ApproveJoin)          // POST
 	mux.HandleFunc("/api/groups/join-requests", gh.PendingJoinRequests) // GET
+	mux.HandleFunc("/api/groups/reject-join", gh.RejectJoin)            // POST
+	mux.HandleFunc("/api/groups/kick", gh.Kick)                         // POST
 	mux.HandleFunc("/api/groups/messages", gh.History)                  // GET
 	mux.HandleFunc("/api/groups/send", gh.Send)                         // POST
 	mux.HandleFunc("/api/groups/members", gh.Members)                   // GET

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -143,6 +144,13 @@ func (h *PostHandler) ListAll(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
+	
+	offset := 0
+	if o := r.URL.Query().Get("offset"); o != "" {
+		if n, _ := strconv.Atoi(o); n >= 0 {
+			offset = n
+		}
+	}
 	viewerID := ""
 	if u, err := auth.FromRequest(h.DB, r); err == nil {
 		viewerID = u.ID
@@ -173,12 +181,12 @@ WHERE
       SELECT 1 FROM post_allowed pa WHERE pa.post_id=p.id AND pa.user_id=?
   ))
 ORDER BY p.created_at DESC
-LIMIT ?`,
+LIMIT ? OFFSET ?`,
 		viewerID,           // ul subquery
 		viewerID, viewerID, // author == viewer
 		viewerID, viewerID, // followers branch
 		viewerID, viewerID, // private branch
-		limit,
+		limit, offset,
 	)
 	if err != nil {
 		Err(w, 500, "db")
@@ -335,18 +343,25 @@ func (h *PostHandler) ToggleLike(w http.ResponseWriter, r *http.Request) {
 		"likes": total,
 	})
 
-	// Broadcast via WebSocket
-	if h.Hub != nil {
-		room := "post:" + strconv.FormatInt(payload.PostID, 10)
-		h.Hub.Broadcast(room, ws.Message{
-			Type: "like_updated", Room: room, From: u.ID, At: time.Now().Unix(),
-			Payload: map[string]any{"postId": payload.PostID, "liked": liked == 1, "likes": total},
-		})
-		h.Hub.Broadcast("feed", ws.Message{
-			Type: "like_updated", Room: "feed", From: u.ID, At: time.Now().Unix(),
-			Payload: map[string]any{"postId": payload.PostID, "liked": liked == 1, "likes": total},
-		})
-	}
+	// Broadcast via WebSocket (in goroutine to avoid blocking HTTP response)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("Panic in like broadcast: %v", r)
+			}
+		}()
+		if h.Hub != nil {
+			room := "post:" + strconv.FormatInt(payload.PostID, 10)
+			h.Hub.Broadcast(room, ws.Message{
+				Type: "like_updated", Room: room, From: u.ID, At: time.Now().Unix(),
+				Payload: map[string]any{"postId": payload.PostID, "liked": liked == 1, "likes": total},
+			})
+			h.Hub.Broadcast("feed", ws.Message{
+				Type: "like_updated", Room: "feed", From: u.ID, At: time.Now().Unix(),
+				Payload: map[string]any{"postId": payload.PostID, "liked": liked == 1, "likes": total},
+			})
+		}
+	}()
 }
 
 // PUT /api/posts/{id}/privacy - Update privacy of a specific post
