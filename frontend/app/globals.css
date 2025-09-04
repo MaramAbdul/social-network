@@ -1,0 +1,159 @@
+@import "tailwindcss";
+@tailwind utilities;
+
+/* Beautiful light theme with sky-inspired colors */
+:root {
+  --background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+  --background-solid: #f0f9ff;
+  --foreground: #374151;
+  --foreground-light: #6b7280;
+  --border: #bae6fd;
+  --card: rgba(255, 255, 255, 0.85);
+  --card-hover: rgba(255, 255, 255, 0.95);
+  --muted: #0ea5e9;
+  --accent: #0369a1;
+  --accent-hover: #075985;
+  --accent-light: #7dd3fc;
+  --success: #059669;
+  --warning: #d97706;
+  --error: #dc2626;
+  --shadow: rgba(3, 105, 161, 0.1);
+  --shadow-hover: rgba(3, 105, 161, 0.2);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Inter', sans-serif;
+  line-height: 1.6;
+  min-height: 100vh;
+}
+
+/* helpers */
+.container {
+  @apply max-w-6xl mx-auto px-4;
+}
+
+.card {
+  @apply rounded-3xl p-6 border;
+  background: var(--card);
+  border-color: var(--border);
+  box-shadow: 0 8px 32px var(--shadow);
+  backdrop-filter: blur(10px);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.card:hover {
+  background: var(--card-hover);
+  box-shadow: 0 12px 48px var(--shadow-hover);
+  transform: translateY(-2px);
+}
+
+.btn {
+  @apply inline-flex items-center justify-center rounded-2xl px-6 py-3 font-semibold transition-all;
+  border: 2px solid var(--border);
+  background: var(--card);
+  color: var(--foreground);
+  box-shadow: 0 4px 16px var(--shadow);
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.btn:hover {
+  background: var(--card-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 24px var(--shadow-hover);
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%);
+  border-color: var(--accent);
+  color: white;
+  box-shadow: 0 4px 16px rgba(3, 105, 161, 0.3);
+}
+
+.btn-primary:hover {
+  background: linear-gradient(135deg, var(--accent-hover) 0%, var(--accent) 100%);
+  box-shadow: 0 6px 24px rgba(3, 105, 161, 0.4);
+  transform: translateY(-2px);
+}
+
+.btn-secondary {
+  @apply inline-flex items-center justify-center rounded-2xl px-6 py-3 font-semibold transition-all;
+  border: 2px solid var(--accent-light);
+  background: transparent;
+  color: var(--accent);
+  backdrop-filter: blur(10px);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.btn-secondary:hover {
+  background: var(--accent-light);
+  color: white;
+  transform: translateY(-1px);
+}
+
+.input {
+  @apply w-full rounded-2xl px-4 py-3 font-medium transition-all;
+  border: 2px solid var(--border);
+  background: var(--card);
+  color: var(--foreground);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 4px 16px var(--shadow);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 4px rgba(108, 92, 231, 0.1), 0 4px 16px var(--shadow);
+  transform: scale(1.02);
+}
+
+.input::placeholder {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+/* Additional utility classes */
+.chip {
+  @apply inline-flex items-center px-3 py-1 rounded-full text-sm font-medium;
+  background: var(--accent-light);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.btn-ghost {
+  @apply inline-flex items-center justify-center rounded-2xl px-4 py-2 font-medium transition-all;
+  background: transparent;
+  color: var(--muted);
+  border: 2px solid transparent;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.btn-ghost:hover {
+  background: var(--accent-light);
+  color: white;
+  transform: translateY(-1px);
+}
+
+.btn-danger {
+  @apply inline-flex items-center justify-center rounded-2xl px-4 py-2 font-semibold transition-all;
+  background: var(--error);
+  border: 2px solid var(--error);
+  color: white;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.btn-danger:hover {
+  background: #b91c1c;
+  border-color: #b91c1c;
+  transform: translateY(-1px);
+  box-shadow: 0 6px 24px rgba(220, 38, 38, 0.4);
+}
+
+/* Emoji support */
+.text-emoji {
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", "Twemoji Mozilla", "Android Emoji", "EmojiSymbols", sans-serif;
+  line-height: 1.5;
+}
